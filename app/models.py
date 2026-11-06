@@ -28,7 +28,8 @@ class AdjFactorRequest(BaseModel):
 
 class FinancialRequest(BaseModel):
     symbols: list[str] = Field(min_length=1, max_length=100)
-    report_type: str = Field(default="zcfzb", min_length=1, max_length=32)
+    report_type: str | None = None  # 优先由 table 映射到对应报表类型
+    table: str | None = None  # 面板以 table 名(income/balance_sheet/...)调用, 兼容别名
 
 
 class DailyRequest(BaseModel):

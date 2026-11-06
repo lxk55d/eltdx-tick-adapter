@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import time
 from datetime import date, datetime, timedelta
@@ -11,6 +12,8 @@ import akshare as ak
 import pandas as pd
 
 from .models import AdapterError
+
+logger = logging.getLogger(__name__)
 
 
 REPORT_TYPES = {"zcfzb": "资产负债表", "lrb": "利润表", "xjllb": "现金流量表"}
@@ -73,6 +76,8 @@ class AkShareClient:
     async def _run(self, function: Any, **kwargs: Any) -> list[dict[str, Any]]:
         try:
             frame = await asyncio.wait_for(asyncio.to_thread(function, **kwargs), self.timeout)
+            if frame is None:
+                return []
             if not isinstance(frame, pd.DataFrame):
                 raise ValueError("AkShare did not return a DataFrame")
             return records(frame)
@@ -168,3 +173,128 @@ class AkShareClient:
                 raise AdapterError(f"unsupported AkShare report type: {params.get('report_type')}")
             return await self._run(self.api.stock_financial_report_sina, stock=code, symbol=report)
         raise AdapterError(f"unsupported AkShare method: {method}")
+
+    async def financial_metrics(self, code: str, symbol: str | None = None) -> list[dict[str, Any]]:
+        """财务指标多期序列(同花顺源, 不受东方财富限流)。
+
+        返回字段经显式映射(见 METRIC_MAP + 元数据字段), 同花顺摘要全量 25 列:
+          symbol, period_end, announce_date (元数据)
+          + 23 指标列(盈利/每股/盈利能力/运营效率/偿债能力)
+        """
+        num = code[2:] if len(code) > 2 and code[:2].isalpha() else code
+        try:
+            frame = await self._run(self.api.stock_financial_abstract_ths, symbol=num)
+        except (Exception, asyncio.TimeoutError) as exc:
+            logger.warning("AkShare financial_metrics failed for %s: %s", code, exc)
+            return []
+        if isinstance(frame, list):
+            frame = pd.DataFrame(frame)
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return []
+        period_col = "报告期"
+        rows: list[dict[str, Any]] = []
+        for _, row in frame.iterrows():
+            period = row.get(period_col)
+            period_end = str(period) if period is not None else None
+            if period_end is None:
+                continue
+            rec: dict[str, Any] = {
+                "symbol": symbol,
+                "period_end": period_end,
+                # 同花顺摘要仅含报告期, 披露日以报告期近似(同季披露, 偏差天数对分析无影响)。
+                "announce_date": period_end,
+            }
+            for cn, en in METRIC_MAP.items():
+                if cn in frame.columns:
+                    value = _clean_num(row.get(cn))
+                    if en not in rec or rec[en] is None:
+                        rec[en] = value
+            rows.append(rec)
+        return rows
+
+    async def financial_income(self, code: str, symbol: str | None = None) -> list[dict[str, Any]]:
+        """利润表(新浪源, ELTDX 网关 lrb 恒空): 中文科目 -> 标准字段名。"""
+        from .report_maps import INCOME_ZH_MAP, _norm_date
+
+        num = code[2:] if len(code) > 2 and code[:2].isalpha() else code
+        try:
+            raw = await self._run(self.api.stock_financial_report_sina, stock=num, symbol="利润表")
+        except (Exception, asyncio.TimeoutError) as exc:
+            logger.warning("AkShare financial_income failed for %s: %s", code, exc)
+            return []
+        if not raw:
+            return []
+        rows: list[dict[str, Any]] = []
+        for r in raw:
+            period_end = _norm_date(r.get("报告日"))
+            if period_end is None:
+                continue
+            ann = _norm_date(r.get("公告日期")) or period_end
+            rec: dict[str, Any] = {
+                "symbol": symbol,
+                "period_end": period_end,
+                "announce_date": ann,
+            }
+            for zh, en in INCOME_ZH_MAP.items():
+                value = r.get(zh)
+                if isinstance(value, (int, float)):
+                    rec[en] = float(value)
+                else:
+                    rec[en] = _clean_num(value) if value is not None else None
+            rows.append(rec)
+        return rows
+
+def _clean_num(value: Any) -> Any:
+    """清洗同花顺财务指标文本: 去 %, 亿/万/千/万亿换算为绝对数值, 'False'/空 -> None。"""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s in ("False", "None", "", "-", "nan", "NaN"):
+        return None
+    negative = s.startswith("-")
+    s = s.lstrip("-")
+    pct = False
+    if s.endswith("%"):
+        s = s[:-1]
+        pct = True
+    mult = 1.0
+    for suffix, m in (("万亿", 1e12), ("亿", 1e8), ("万", 1e4), ("千", 1e3)):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+            mult *= m
+            break
+    try:
+        num = float(s)
+    except ValueError:
+        return None
+    if negative:
+        num = -num
+    num *= mult
+    if pct:
+        num /= 100.0
+    return num
+
+
+# metrics 字段映射(同花顺摘要 -> 面板 59 个规范内部字段的子集)
+#   仅保留面板规范字段; 非规范字段(资本公积金/流动比率/周转天数/产权比率等)不映射。
+#   元数据列(3, 方法内生成): symbol, period_end, announce_date。roa/operating_cash_to_revenue 跨表派生。
+METRIC_MAP = {
+    # 盈利
+    "净利润": "net_income_attributable",
+    "扣非净利润": "net_income_deducted",
+    "净利润同比增长率": "net_income_yoy",
+    "营业总收入": "revenue",
+    "营业总收入同比增长率": "revenue_yoy",
+    # 每股
+    "基本每股收益": "eps_basic",
+    "每股净资产": "bps",
+    "每股经营现金流": "ocfps",
+    # 盈利能力
+    "销售净利率": "net_margin",
+    "销售毛利率": "gross_margin",
+    "净资产收益率": "roe",
+    "净资产收益率-摊薄": "roe_diluted",
+    # 运营/偿债(规范字段)
+    "存货周转率": "inventory_turnover",
+    "资产负债率": "debt_to_asset_ratio",
+}

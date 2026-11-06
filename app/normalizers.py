@@ -8,12 +8,47 @@ from typing import Any
 _PERIOD_COUNTS = {"1m": 240, "5m": 48, "15m": 16, "30m": 8, "60m": 4}
 
 
+def canonical_symbol(value: Any) -> str | None:
+    """把任意格式的 symbol 归一为面板存储键 (600519.SH / 000001.SZ)。
+
+    上游 bars 行内不带 code 时, normalizers 会用请求里的 symbol 兜底回显;
+    若请求是裸符号 (TSP v0.3.28 修复轮会这么发), 原样回显会把同一只票写成
+    两个不同的 symbol, 分裂分钟/日线分区。这里统一收敛。
+    """
+    if not isinstance(value, str):
+        return None
+    raw = value.strip().upper()
+    if "." in raw:
+        code, market = raw.split(".", 1)
+        market = {"SHA": "SH", "SHE": "SZ", "BJA": "BJ"}.get(market, market)
+        if code.isdigit() and market in {"SH", "SZ", "BJ"}:
+            return f"{code.zfill(6)}.{market}"
+        return raw
+    if raw[:2] in {"SH", "SZ", "BJ"} and raw[2:].isdigit():
+        return f"{raw[2:]}.{raw[:2]}"
+    if raw.isdigit() and len(raw) == 6:
+        market = "SH" if raw[0] in "569" else "BJ" if raw[0] in "48" else "SZ"
+        return f"{raw}.{market}"
+    return None
+
+
 def to_tdx_code(symbol: str) -> str:
-    code, market = symbol.upper().split(".", 1)
-    prefix = {"SZ": "sz", "SH": "sh", "BJ": "bj"}.get(market)
-    if prefix is None or not code.isdigit():
-        raise ValueError(f"unsupported symbol: {symbol}")
-    return f"{prefix}{code}"
+    raw = symbol.upper().strip()
+    # 前缀式 (SH600519) —— 旧契约
+    if raw[:2] in {"SH", "SZ", "BJ"} and raw[2:].isdigit():
+        return raw.lower()
+    # 裸符号 (600519) —— TSP v0.3.28 修复轮按首位数字推断交易所
+    if raw.isdigit() and len(raw) == 6:
+        market = "SH" if raw[0] in "569" else "BJ" if raw[0] in "48" else "SZ"
+        return f"{'sh' if market == 'SH' else 'bj' if market == 'BJ' else 'sz'}{raw}"
+    # 后缀式 (600519.SH / 600519.SHA) —— TSP v0.3.28 起的新契约
+    if "." in raw:
+        code, market = raw.split(".", 1)
+        market = {"SHA": "SH", "SHE": "SZ", "BJA": "BJ"}.get(market, market)
+        prefix = {"SZ": "sz", "SH": "sh", "BJ": "bj"}.get(market)
+        if prefix is not None and code.isdigit():
+            return f"{prefix}{code}"
+    raise ValueError(f"unsupported symbol: {symbol}")
 
 
 def from_tdx_code(value: Any, market: Any = None) -> str | None:
@@ -90,6 +125,7 @@ def normalize_daily(row: dict[str, Any], fallback_symbol: str) -> dict[str, Any]
             row.get("symbol") or row.get("code") or row.get("ts_code"),
             row.get("exchange") or row.get("market"),
         )
+        or canonical_symbol(fallback_symbol)
         or fallback_symbol
     )
     date_value = row.get("date") or row.get("trade_date") or row.get("datetime") or row.get("time") or row.get("date_ms")
@@ -135,6 +171,7 @@ def normalize_bar(row: dict[str, Any], fallback_symbol: str) -> dict[str, Any] |
             row.get("symbol") or row.get("code") or row.get("ts_code"),
             row.get("exchange") or row.get("market"),
         )
+        or canonical_symbol(fallback_symbol)
         or fallback_symbol
     )
     timestamp = row.get("datetime") or row.get("date") or row.get("time")
@@ -168,6 +205,7 @@ def normalize_depth5(row: dict[str, Any], fallback_symbol: str) -> dict[str, Any
             row.get("symbol") or row.get("code") or row.get("ts_code"),
             row.get("exchange") or row.get("market"),
         )
+        or canonical_symbol(fallback_symbol)
         or fallback_symbol
     )
 
